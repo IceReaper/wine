@@ -911,6 +911,51 @@ static void parse_command_line(LPWSTR commandline,parameters_struct *parameters)
     }
 }
 
+/* Milleninux runs Windows programs in a desktop session with a file manager of its own. It names a directory in
+ * MILLENINUX_FOLDER_REQUESTS; a folder window then becomes a file there holding the folder's Unix path, which the
+ * session opens. The file gets its final name only once written, so the session never reads half a path. */
+static BOOL request_session_folder(const WCHAR *folder)
+{
+    WCHAR variable[MAX_PATH], full[MAX_PATH], temp[MAX_PATH], request[MAX_PATH], *requests;
+    char unix_requests[MAX_PATH * 3], *unix_folder;
+    HANDLE file;
+    DWORD written;
+    BOOL ret;
+
+    if (!GetEnvironmentVariableW(L"MILLENINUX_FOLDER_REQUESTS", variable, ARRAY_SIZE(variable))) return FALSE;
+    if (!WideCharToMultiByte(CP_UTF8, 0, variable, -1, unix_requests, sizeof(unix_requests), NULL, NULL)) return FALSE;
+    if (!GetFullPathNameW(folder, ARRAY_SIZE(full), full, NULL)) return FALSE;
+    if (!(requests = wine_get_dos_file_name(unix_requests))) return FALSE;
+    if (!(unix_folder = wine_get_unix_file_name(full)))
+    {
+        HeapFree(GetProcessHeap(), 0, requests);
+        return FALSE;
+    }
+
+    ret = GetTempFileNameW(requests, L"fld", 0, temp);
+    HeapFree(GetProcessHeap(), 0, requests);
+    if (ret)
+    {
+        file = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        ret = file != INVALID_HANDLE_VALUE;
+        if (ret)
+        {
+            ret = WriteFile(file, unix_folder, strlen(unix_folder), &written, NULL);
+            CloseHandle(file);
+        }
+        lstrcpyW(request, temp);
+        PathRenameExtensionW(request, L".folder");
+        if (!ret || !MoveFileW(temp, request))
+        {
+            DeleteFileW(temp);
+            ret = FALSE;
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, unix_folder);
+    if (!ret) WARN("could not hand %s to the session\n", debugstr_w(full));
+    return ret;
+}
+
 int WINAPI wWinMain(HINSTANCE hinstance,
                     HINSTANCE previnstance,
                     LPWSTR cmdline,
@@ -933,6 +978,8 @@ int WINAPI wWinMain(HINSTANCE hinstance,
     if(parameters.root[0] && !PathIsDirectoryW(parameters.root))
         if(ShellExecuteW(NULL,NULL,parameters.root,NULL,NULL,SW_SHOWDEFAULT) > (HINSTANCE)32)
             ExitProcess(EXIT_SUCCESS);
+    if(parameters.root[0] && PathIsDirectoryW(parameters.root) && request_session_folder(parameters.root))
+        ExitProcess(EXIT_SUCCESS);
     init_info.dwSize = sizeof(INITCOMMONCONTROLSEX);
     init_info.dwICC = ICC_USEREX_CLASSES | ICC_BAR_CLASSES | ICC_COOL_CLASSES;
     if(!InitCommonControlsEx(&init_info))
