@@ -91,10 +91,59 @@ static inline BOOL Dde_OnWildConnect(HSZ hszTopic, HSZ hszService)
     return FALSE;
 }
 
+/* Some Win9x-era installers name a group by an absolute path, as Yoda Stories names its install folder
+ * "C:\PROGRA~1\LUCASA~1\YODA", and Windows 95 then keeps the group's items in that very folder instead of the Start
+ * Menu. */
+static BOOL is_absolute_group(const WCHAR *name)
+{
+    return PathGetDriveNumberW(name) != -1 && name[2] == '\\';
+}
+
+/* Win9x-era installers name groups like "Company\Product" and expect the Start Menu to nest them, so a backslash in
+ * a relative group name separates folders. Any other name with a colon or a leading backslash stays one folder with
+ * those characters replaced. */
+static BOOL is_nested_group(const WCHAR *name)
+{
+    return name[0] != '\\' && !wcschr(name, ':');
+}
+
+/* Returned string must be freed by caller */
+static WCHAR *sanitize_name(const WCHAR *name, BOOL nested)
+{
+    WCHAR *sanitized = wcsdup(name), *component, *end;
+    int i;
+
+    for (i = 0; i < wcslen(name); i++)
+    {
+        if (nested && name[i] == '\\')
+            continue;
+        if (name[i] < ' ' || wcschr(L"*/:<>?\\|", name[i]))
+            sanitized[i] = '_';
+    }
+
+    if (!nested)
+        return sanitized;
+
+    /* "." and ".." would leave the group's parent folder. */
+    for (component = sanitized; *component; component = *end ? end + 1 : end)
+    {
+        end = wcschr(component, '\\');
+        if (!end) end = component + wcslen(component);
+        if ((end - component == 1 && component[0] == '.') ||
+            (end - component == 2 && component[0] == '.' && component[1] == '.'))
+        {
+            for (i = 0; i < end - component; i++)
+                component[i] = '_';
+        }
+    }
+
+    return sanitized;
+}
+
 static WCHAR *combine_path(const WCHAR *directory, const WCHAR *name, const WCHAR *extension, BOOL sanitize)
 {
     WCHAR *path;
-    int len, i;
+    int len;
 
     len = wcslen(directory) + 1 + wcslen(name);
     if (extension) len += wcslen(extension);
@@ -102,13 +151,7 @@ static WCHAR *combine_path(const WCHAR *directory, const WCHAR *name, const WCHA
 
     if (sanitize)
     {
-        WCHAR *sanitized_name = wcsdup(name);
-
-        for (i = 0; i < wcslen(name); i++)
-        {
-            if (name[i] < ' ' || wcschr(L"*/:<>?\\|", name[i]))
-                sanitized_name[i] = '_';
-        }
+        WCHAR *sanitized_name = sanitize_name(name, FALSE);
 
         PathCombineW(path, directory, sanitized_name);
         free(sanitized_name);
@@ -124,16 +167,51 @@ static WCHAR *combine_path(const WCHAR *directory, const WCHAR *name, const WCHA
     return path;
 }
 
+/* A group is common (all users) or personal. The optional CommonGroupFlag argument chooses; without it a group is
+ * common for administrators, as up to Windows XP. Installers and uninstallers of that time rely on this: they look for
+ * an administrator's groups in CSIDL_COMMON_PROGRAMS, not where Vista and later put them. */
+static const KNOWNFOLDERID *get_group_root(int argc, WCHAR **argv, int flag)
+{
+    BOOL common = argc > flag ? wcstol(argv[flag], NULL, 10) != 0 : IsUserAnAdmin();
+
+    return common ? &FOLDERID_CommonPrograms : &FOLDERID_Programs;
+}
+
 /* Returned string must be freed by caller */
-static WCHAR *get_programs_path(const WCHAR *name, BOOL sanitize)
+static WCHAR *get_programs_path(const KNOWNFOLDERID *root, const WCHAR *name, BOOL sanitize)
 {
     WCHAR *programs, *path;
 
-    SHGetKnownFolderPath(&FOLDERID_Programs, 0, NULL, &programs);
-    path = combine_path(programs, name, NULL, sanitize);
+    if (sanitize && is_absolute_group(name))
+        return wcsdup(name);
+
+    SHGetKnownFolderPath(root, 0, NULL, &programs);
+    if (sanitize)
+    {
+        WCHAR *sanitized_name = sanitize_name(name, is_nested_group(name));
+
+        path = combine_path(programs, sanitized_name, NULL, FALSE);
+        free(sanitized_name);
+    }
+    else
+    {
+        path = combine_path(programs, name, NULL, FALSE);
+    }
     CoTaskMemFree(programs);
 
     return path;
+}
+
+/* A nested group's parent folders go with their last group, as they were only made for it. */
+static void remove_empty_parents(const KNOWNFOLDERID *root, const WCHAR *group)
+{
+    WCHAR *programs, *folder = wcsdup(group);
+
+    SHGetKnownFolderPath(root, 0, NULL, &programs);
+    while (PathRemoveFileSpecW(folder) && wcslen(folder) > wcslen(programs) && RemoveDirectoryW(folder))
+        ;
+    CoTaskMemFree(programs);
+    free(folder);
 }
 
 static inline HDDEDATA Dde_OnRequest(UINT uFmt, HCONV hconv, HSZ hszTopic,
@@ -150,7 +228,7 @@ static inline HDDEDATA Dde_OnRequest(UINT uFmt, HCONV hconv, HSZ hszTopic,
         HDDEDATA ret = NULL;
 
         groups_data[0] = 0;
-        programs = get_programs_path(L"*", FALSE);
+        programs = get_programs_path(get_group_root(0, NULL, 0), L"*", FALSE);
         hfind = FindFirstFileW(programs, &finddata);
         if (hfind)
         {
@@ -212,9 +290,9 @@ static DWORD PROGMAN_OnExecute(WCHAR *command, int argc, WCHAR **argv)
 
         if (argc < 1) return DDE_FNOTPROCESSED;
 
-        path = get_programs_path(argv[0], TRUE);
+        path = get_programs_path(get_group_root(argc, argv, 1), argv[0], TRUE);
 
-        CreateDirectoryW(path, NULL);
+        SHCreateDirectoryExW(NULL, path, NULL);
         ShellExecuteW(NULL, NULL, path, NULL, NULL, SW_SHOWNORMAL);
 
         free(last_group);
@@ -222,13 +300,24 @@ static DWORD PROGMAN_OnExecute(WCHAR *command, int argc, WCHAR **argv)
     }
     else if (!wcsicmp(command, L"DeleteGroup"))
     {
+        const KNOWNFOLDERID *root;
         WCHAR *path, *path2;
         SHFILEOPSTRUCTW shfos = {0};
         int ret;
 
         if (argc < 1) return DDE_FNOTPROCESSED;
 
-        path = get_programs_path(argv[0], TRUE);
+        root = get_group_root(argc, argv, 1);
+        path = get_programs_path(root, argv[0], TRUE);
+
+        /* An absolute group is a folder outside the Start Menu, often the program's own: only an empty one goes, so
+         * that deleting the group never deletes the program or whatever else the folder holds. */
+        if (is_absolute_group(argv[0]))
+        {
+            ret = RemoveDirectoryW(path);
+            free(path);
+            return ret ? DDE_FACK : DDE_FNOTPROCESSED;
+        }
 
         path2 = malloc((lstrlenW(path) + 2) * sizeof(*path));
         lstrcpyW(path2, path);
@@ -239,6 +328,8 @@ static DWORD PROGMAN_OnExecute(WCHAR *command, int argc, WCHAR **argv)
         shfos.fFlags = FOF_NOCONFIRMATION;
 
         ret = SHFileOperationW(&shfos);
+        if (!ret && !shfos.fAnyOperationsAborted)
+            remove_empty_parents(root, path);
 
         free(path2);
         free(path);
@@ -253,7 +344,7 @@ static DWORD PROGMAN_OnExecute(WCHAR *command, int argc, WCHAR **argv)
          * ignore its actual value. */
         if (argc < 2) return DDE_FNOTPROCESSED;
 
-        path = get_programs_path(argv[0], TRUE);
+        path = get_programs_path(get_group_root(argc, argv, 2), argv[0], TRUE);
 
         ShellExecuteW(NULL, NULL, path, NULL, NULL, SW_SHOWNORMAL);
 
